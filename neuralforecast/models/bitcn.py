@@ -97,13 +97,17 @@ class BiTCN(BaseModel):
         futr_exog_list (list): future exogenous columns.
         hist_exog_list (list): historic exogenous columns.
         stat_exog_list (list): static exogenous columns.
+        cat_exog_list (list): exogenous columns (from `hist_exog_list` / `futr_exog_list` / `stat_exog_list`) to embed instead of scale.
+        categorical_cardinalities (dict): mapping from each categorical column to its number of distinct categories.
+        cat_emb_dim (str or int): categorical embedding size strategy ('fastai', 'sqrt', 'half') or an explicit integer.
         exclude_insample_y (bool): the model skips the autoregressive features y[t-input_size:t] if True. Default: False.
-        loss (nn.Module): PyTorch module, instantiated train loss class from [losses collection](./losses.pytorch).
-        valid_loss (nn.Module): PyTorch module, instantiated valid loss class from [losses collection](./losses.pytorch).
+        loss (nn.Module): PyTorch module, instantiated train loss class from [losses collection](./losses.pytorch.html).
+        valid_loss (nn.Module): PyTorch module, instantiated valid loss class from [losses collection](./losses.pytorch.html).
         max_steps (int): maximum number of training steps. Default: 1000.
         learning_rate (float): Learning rate between (0, 1). Default: 1e-3.
         num_lr_decays (int): Number of learning rate decays, evenly distributed across max_steps. Default: -1.
         early_stop_patience_steps (int): Number of validation iterations before early stopping. Default: -1.
+        val_monitor (str): metric to monitor for early stopping. Valid options: "ptl/val_loss", "valid_loss", "train_loss". Default: "ptl/val_loss".
         val_check_steps (int): Number of training steps between every validation loss check. Default: 100.
         batch_size (int): number of different series in each batch. Default: 32.
         valid_batch_size (int): number of different series in each validation and test batch, if None uses batch_size. Default: None.
@@ -121,7 +125,7 @@ class BiTCN(BaseModel):
         lr_scheduler (Subclass of 'torch.optim.lr_scheduler.LRScheduler'): optional, user specified lr_scheduler instead of the default choice (StepLR).
         lr_scheduler_kwargs (dict): optional, list of parameters used by the user specified `lr_scheduler`.
         dataloader_kwargs (dict): optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`.
-        **trainer_kwargs (int): keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
+        **trainer_kwargs (int): keyword trainer arguments inherited from [PyTorch Lightning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
 
     References:
         - [Olivier Sprangers, Sebastian Schelter, Maarten de Rijke (2023). Parameter-Efficient Deep Probabilistic Forecasting. International Journal of Forecasting 39, no. 1 (1 January 2023): 333-345.](https://doi.org/10.1016/j.ijforecast.2021.11.011)
@@ -132,6 +136,7 @@ class BiTCN(BaseModel):
     EXOGENOUS_FUTR = True
     EXOGENOUS_HIST = True
     EXOGENOUS_STAT = True
+    EXOGENOUS_CAT = True
     MULTIVARIATE = False  # If the model produces multivariate forecasts (True) or univariate (False)
     RECURRENT = (
         False  # If the model produces forecasts recursively (True) or direct (False)
@@ -146,6 +151,9 @@ class BiTCN(BaseModel):
         futr_exog_list=None,
         hist_exog_list=None,
         stat_exog_list=None,
+        cat_exog_list=None,
+        categorical_cardinalities=None,
+        cat_emb_dim="fastai",
         exclude_insample_y=False,
         loss=MAE(),
         valid_loss=None,
@@ -153,6 +161,7 @@ class BiTCN(BaseModel):
         learning_rate: float = 1e-3,
         num_lr_decays: int = -1,
         early_stop_patience_steps: int = -1,
+        val_monitor: str = "ptl/val_loss",
         val_check_steps: int = 100,
         batch_size: int = 32,
         valid_batch_size: Optional[int] = None,
@@ -178,6 +187,9 @@ class BiTCN(BaseModel):
             futr_exog_list=futr_exog_list,
             hist_exog_list=hist_exog_list,
             stat_exog_list=stat_exog_list,
+            cat_exog_list=cat_exog_list,
+            categorical_cardinalities=categorical_cardinalities,
+            cat_emb_dim=cat_emb_dim,
             exclude_insample_y=exclude_insample_y,
             loss=loss,
             valid_loss=valid_loss,
@@ -185,6 +197,7 @@ class BiTCN(BaseModel):
             learning_rate=learning_rate,
             num_lr_decays=num_lr_decays,
             early_stop_patience_steps=early_stop_patience_steps,
+            val_monitor=val_monitor,
             val_check_steps=val_check_steps,
             batch_size=batch_size,
             valid_batch_size=valid_batch_size,

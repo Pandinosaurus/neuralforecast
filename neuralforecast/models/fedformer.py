@@ -374,7 +374,7 @@ class FourierCrossAttention(nn.Module):
             xqk_ft = torch.complex(xqk_ft, torch.zeros_like(xqk_ft))
         else:
             raise Exception(
-                "{} actiation function is not implemented".format(self.activation)
+                "{} activation function is not implemented".format(self.activation)
             )
         xqkv_ft = torch.einsum("bhxy,bhey->bhex", xqk_ft, xk_ft_)
         xqkvw = torch.einsum("bhex,heox->bhox", xqkv_ft, self.weights1)
@@ -409,6 +409,9 @@ class FEDformer(BaseModel):
         stat_exog_list (List[str]): static exogenous columns.
         hist_exog_list (List[str]): historic exogenous columns.
         futr_exog_list (List[str]): future exogenous columns.
+        cat_exog_list (List[str]): exogenous columns (from `hist_exog_list` / `futr_exog_list`) to embed instead of scale.
+        categorical_cardinalities (dict): mapping from each categorical column to its number of distinct categories.
+        cat_emb_dim (str or int): categorical embedding size strategy ('fastai', 'sqrt', 'half') or an explicit integer.
         decoder_input_size_multiplier (float): multiplier for the input size of the decoder.
         version (str): version of the model.
         modes (int): number of modes for the Fourier block.
@@ -421,12 +424,13 @@ class FEDformer(BaseModel):
         encoder_layers (int): number of layers for the TCN encoder.
         decoder_layers (int): number of layers for the MLP decoder.
         MovingAvg_window (int): window size for the moving average filter.
-        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch).
-        valid_loss (PyTorch module): instantiated validation loss class from [losses collection](./losses.pytorch).
+        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch.html).
+        valid_loss (PyTorch module): instantiated validation loss class from [losses collection](./losses.pytorch.html).
         max_steps (int): maximum number of training steps.
         learning_rate (float): Learning rate between (0, 1).
         num_lr_decays (int): Number of learning rate decays, evenly distributed across max_steps.
         early_stop_patience_steps (int): Number of validation iterations before early stopping.
+        val_monitor (str): metric to monitor for early stopping. Valid options: "ptl/val_loss", "valid_loss", "train_loss". Default: "ptl/val_loss".
         val_check_steps (int): Number of training steps between every validation loss check.
         batch_size (int): number of different series in each batch.
         valid_batch_size (int): number of different series in each validation and test batch, if None uses batch_size.
@@ -444,7 +448,7 @@ class FEDformer(BaseModel):
         lr_scheduler (Subclass of 'torch.optim.lr_scheduler.LRScheduler'): optional, user specified lr_scheduler instead of the default choice (StepLR).
         lr_scheduler_kwargs (dict): optional, list of parameters used by the user specified lr_scheduler.
         dataloader_kwargs (dict): optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`.
-        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
+        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lightning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
 
     References:
         - [Tian Zhou, et al. "FEDformer: Frequency Enhanced Decomposed Transformer for Long-term Series Forecasting" Proceedings of the AAAI conference on artificial intelligence. Vol. 37. No. 9. 2023."](https://arxiv.org/abs/2201.12740)
@@ -455,6 +459,7 @@ class FEDformer(BaseModel):
     EXOGENOUS_FUTR = True
     EXOGENOUS_HIST = False
     EXOGENOUS_STAT = False
+    EXOGENOUS_CAT = True
     MULTIVARIATE = False  # If the model produces multivariate forecasts (True) or univariate (False)
     RECURRENT = (
         False  # If the model produces forecasts recursively (True) or direct (False)
@@ -467,6 +472,9 @@ class FEDformer(BaseModel):
         stat_exog_list=None,
         hist_exog_list=None,
         futr_exog_list=None,
+        cat_exog_list=None,
+        categorical_cardinalities=None,
+        cat_emb_dim="fastai",
         decoder_input_size_multiplier: float = 0.5,
         version: str = "Fourier",
         modes: int = 64,
@@ -485,6 +493,7 @@ class FEDformer(BaseModel):
         learning_rate: float = 1e-4,
         num_lr_decays: int = -1,
         early_stop_patience_steps: int = -1,
+        val_monitor: str = "ptl/val_loss",
         val_check_steps: int = 100,
         batch_size: int = 32,
         valid_batch_size: Optional[int] = None,
@@ -510,12 +519,16 @@ class FEDformer(BaseModel):
             stat_exog_list=stat_exog_list,
             hist_exog_list=hist_exog_list,
             futr_exog_list=futr_exog_list,
+            cat_exog_list=cat_exog_list,
+            categorical_cardinalities=categorical_cardinalities,
+            cat_emb_dim=cat_emb_dim,
             loss=loss,
             valid_loss=valid_loss,
             max_steps=max_steps,
             learning_rate=learning_rate,
             num_lr_decays=num_lr_decays,
             early_stop_patience_steps=early_stop_patience_steps,
+            val_monitor=val_monitor,
             val_check_steps=val_check_steps,
             batch_size=batch_size,
             valid_batch_size=valid_batch_size,

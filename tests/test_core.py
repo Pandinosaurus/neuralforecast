@@ -32,7 +32,9 @@ from neuralforecast.auto import (
     DeepAR,
     DilatedRNN,
     Informer,
+    MLPMultivariate,
     NBEATSx,
+    RayOptions,
     StemGNN,
     TSMixer,
     TSMixerx,
@@ -48,15 +50,19 @@ from neuralforecast.core import (
     PredictionIntervals,
     TimesNet,
     _insample_times,
+    _type2scaler,
 )
 from neuralforecast.losses.pytorch import (
     GMM,
     MAE,
+    MASE,
     NBMM,
     PMM,
     DistributionLoss,
     MQLoss,
+    sCRPS,
 )
+from neuralforecast.tsdataset import TimeSeriesDataset
 from neuralforecast.utils import (
     AirPassengersPanel,
     AirPassengersStatic,
@@ -134,8 +140,88 @@ def test_neural_forecast_early_stopping(setup_airplane_data):
     AirPassengersPanel_train, _ = setup_airplane_data
     models = [NHITS(h=12, input_size=12, max_steps=1, early_stop_patience_steps=5)]
     nf = NeuralForecast(models=models, freq="M")
-    with pytest.raises(Exception, match="Set val_size>0 if early stopping is enabled."):
+    with pytest.raises(Exception, match="Set val_size>0 or provide a val_df if early stopping is enabled."):
         nf.fit(AirPassengersPanel_train)
+
+
+# Unittest for configurable val_monitor with early stopping
+def test_neural_forecast_val_monitor():
+    from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+
+    model = NHITS(
+        h=12,
+        input_size=12,
+        max_steps=5,
+        early_stop_patience_steps=3,
+        val_monitor="valid_loss",
+    )
+    callbacks = model.trainer_kwargs["callbacks"]
+    early_stopping_cb = next(cb for cb in callbacks if isinstance(cb, EarlyStopping))
+    assert early_stopping_cb.monitor == "valid_loss"
+
+
+def test_neural_forecast_val_monitor_invalid():
+    with pytest.raises(ValueError, match="val_monitor="):
+        NHITS(
+            h=12,
+            input_size=12,
+            max_steps=5,
+            early_stop_patience_steps=3,
+            val_monitor="nonexistent_metric",
+        )
+
+
+# Conformal calibration retrains the models via cross-validation; it must forward
+# the same val_size as the main fit so early stopping doesn't crash.
+def test_prediction_intervals_with_early_stopping(setup_airplane_data):
+    AirPassengersPanel_train, _ = setup_airplane_data
+    model = NHITS(
+        h=12,
+        input_size=12,
+        max_steps=2,
+        val_check_steps=1,
+        early_stop_patience_steps=2,
+        val_monitor="ptl/val_loss",
+    )
+    nf = NeuralForecast(models=[model], freq="ME")
+    nf.fit(
+        AirPassengersPanel_train,
+        val_size=12,
+        prediction_intervals=PredictionIntervals(n_windows=2),
+    )
+    preds = nf.predict(level=[80])
+    assert "NHITS-lo-80" in preds.columns
+    assert "NHITS-hi-80" in preds.columns
+
+
+# test that fit raises ValueError when series are too short for input_size + h
+def test_fit_raises_on_short_series():
+    # 10 timestamps, h=12, input_size=24 → train_size=10 < 24
+    series = generate_series(n_series=2, min_length=10, max_length=10, equal_ends=True)
+    model = NHITS(h=12, input_size=24, max_steps=2)
+    nf = NeuralForecast(models=[model], freq="D")
+    with pytest.raises(ValueError, match="requires at least"):
+        nf.fit(series)
+
+
+# test that fit passes when start_padding_enabled=True relaxes the constraint
+def test_fit_short_series_with_start_padding():
+    # 10 timestamps, h=12, input_size=24 but padding enabled → only needs 1 timestamp
+    series = generate_series(n_series=2, min_length=10, max_length=10, equal_ends=True)
+    model = NHITS(h=12, input_size=24, max_steps=2, start_padding_enabled=True)
+    nf = NeuralForecast(models=[model], freq="D")
+    nf.fit(series)  # should not raise
+
+
+# test that cross_validation raises ValueError when series are too short (refit=True
+# calls fit() per window, which validates the training slice length)
+def test_cross_validation_raises_on_short_series():
+    # 30 timestamps, h=12, n_windows=1 → train slice=18 timestamps < input_size=24
+    series = generate_series(n_series=2, min_length=30, max_length=30, equal_ends=True)
+    model = NHITS(h=12, input_size=24, max_steps=2)
+    nf = NeuralForecast(models=[model], freq="D")
+    with pytest.raises(ValueError, match="requires at least"):
+        nf.cross_validation(series, n_windows=1, refit=True)
 
 
 # test fit+cross_validation behaviour
@@ -151,6 +237,34 @@ def test_neural_forecast_fit_cross_validation(setup_airplane_data):
     after_fcst = nf.predict()
     pd.testing.assert_frame_equal(init_cv, after_cv)
     pd.testing.assert_frame_equal(after_fcst, init_fcst)
+
+
+# cross_validation() with no `df` should reuse the stored dataset.
+@pytest.mark.parametrize("local_scaler_type", [None, "standard"])
+@pytest.mark.parametrize("use_polars", [False, True])
+def test_cross_validation_without_df_uses_stored_dataset(
+    use_polars, local_scaler_type, setup_airplane_data, setup_airplane_data_polars
+):
+    if use_polars:
+        df, _ = setup_airplane_data_polars
+        freq = "1mo"
+        col_kwargs = dict(id_col="uid", time_col="time", target_col="target")
+        assert_frame_equal = polars.testing.assert_frame_equal
+    else:
+        df, _ = setup_airplane_data
+        freq = "M"
+        col_kwargs = {}
+        assert_frame_equal = pd.testing.assert_frame_equal
+
+    models = [NHITS(h=12, input_size=24, max_steps=2, random_seed=0)]
+    nf = NeuralForecast(models=models, freq=freq, local_scaler_type=local_scaler_type)
+    nf.fit(df, **col_kwargs)
+    # use_init_models resets to the same seeded weights before each run
+    cv_with_df = nf.cross_validation(df, use_init_models=True, **col_kwargs)
+    # No column kwargs here: the stored dataset's column names must be preserved.
+    cv_no_df = nf.cross_validation(use_init_models=True)
+    assert_frame_equal(cv_no_df, cv_with_df)
+
 
 # test cross_validation with refit
 def test_neural_forecast_refit(setup_airplane_data):
@@ -189,6 +303,64 @@ def test_neural_forecast_refit(setup_airplane_data):
                 cv_res_norefit.drop(expected.index).reset_index(drop=True),
                 cv_res.drop(actual.index).reset_index(drop=True),
             )
+
+
+# Cross_validation(refit=True, val_size=...) must give each refit window a fresh
+# EarlyStopping state. Otherwise the prior window's wait_count and best_score
+# carry over and subsequent refits stop on the first validation check.
+def test_cross_validation_refit_resets_early_stopping(setup_airplane_data):
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+
+    AirPassengersPanel_train, _ = setup_airplane_data
+
+    class _CaptureEarlyStoppingState(pl.Callback):
+        def __init__(self):
+            self.snapshots = []
+
+        def on_train_start(self, trainer, pl_module):
+            es = next(
+                (cb for cb in trainer.callbacks if isinstance(cb, EarlyStopping)),
+                None,
+            )
+            assert es is not None, "EarlyStopping callback missing from trainer"
+            self.snapshots.append(
+                {
+                    "wait_count": es.wait_count,
+                    "stopped_epoch": es.stopped_epoch,
+                    "best_score": float(es.best_score),
+                }
+            )
+
+    model = NHITS(
+        h=12,
+        input_size=24,
+        max_steps=4,
+        val_check_steps=1,
+        early_stop_patience_steps=1,
+        callbacks=[_CaptureEarlyStoppingState()],
+        enable_progress_bar=False,
+    )
+    nf = NeuralForecast(models=[model], freq="M")
+    capture = next(
+        cb
+        for cb in nf.models[0].trainer_kwargs["callbacks"]
+        if isinstance(cb, _CaptureEarlyStoppingState)
+    )
+
+    nf.cross_validation(
+        df=AirPassengersPanel_train,
+        val_size=12,
+        n_windows=3,
+        refit=True,
+    )
+
+    # One fit per refit window.
+    assert len(capture.snapshots) == 3, capture.snapshots
+    for i, snap in enumerate(capture.snapshots):
+        assert snap["wait_count"] == 0, (i, snap)
+        assert snap["stopped_epoch"] == 0, (i, snap)
+        assert snap["best_score"] == float("inf"), (i, snap)
 
 
 def test_neural_forecast_scaling(setup_airplane_data):
@@ -309,6 +481,232 @@ def test_neural_forecast_scaling(setup_airplane_data):
     )
 
 
+def test_local_scaler_refits_on_transfer_learning():
+    """Local scalers must be refit on new data when predict(df=...) is called.
+
+    Regression test: previously, predict(df=new_df) reused scalers fitted on
+    training data, producing wrong statistics for shifted series.
+    """
+    series = generate_series(10, min_length=100, max_length=200, equal_ends=True)
+    h = 7
+    valid = series.groupby("unique_id", observed=True).tail(h)
+    train = series.drop(valid.index)
+
+    # Shift all values by a large constant to simulate a different distribution
+    train2 = train.copy()
+    train2["y"] += 1000
+    valid2 = valid.copy()
+    valid2["y"] += 1000
+
+    nf = NeuralForecast(
+        models=[LSTM(input_size=2 * h, h=h, scaler_type=None, max_steps=10, val_check_steps=10, enable_progress_bar=False)],
+        freq="D",
+        local_scaler_type="standard",
+    )
+    nf.fit(train)
+
+    preds = nf.predict()
+    preds2 = nf.predict(df=train2)
+
+    def rmse(fcsts, actual):
+        merged = fcsts.merge(actual[["unique_id", "ds", "y"]], on=["unique_id", "ds"])
+        return np.sqrt(((merged["LSTM"] - merged["y"]) ** 2).mean())
+
+    error1 = rmse(preds, valid)
+    error2 = rmse(preds2, valid2)
+
+    # Both errors should be in the same ballpark — if scalers weren't refit,
+    # error2 would be ~1000x larger than error1.
+    assert error2 < error1 * 10, (
+        f"predict(df=shifted_data) error ({error2:.2f}) is much larger than "
+        f"predict() error ({error1:.2f}), suggesting scalers were not refit."
+    )
+
+    # Calling predict() afterwards should still use the original training scalers
+    preds_again = nf.predict()
+    np.testing.assert_array_equal(
+        preds["LSTM"].values,
+        preds_again["LSTM"].values,
+        err_msg="predict() after predict(df=...) should return the same results as before.",
+    )
+
+
+def test_use_init_models_emits_warning():
+    """Calling fit with use_init_models=True on an already-fitted model warns."""
+    h = 5
+    series = generate_series(3, min_length=100, max_length=100, equal_ends=True)
+    nf = NeuralForecast(
+        models=[
+            MLP(
+                input_size=2 * h,
+                h=h,
+                scaler_type=None,
+                max_steps=2,
+                val_check_steps=2,
+                enable_progress_bar=False,
+            )
+        ],
+        freq="D",
+    )
+    nf.fit(series)
+    with pytest.warns(UserWarning, match="Deleting previously fitted models"):
+        nf.fit(series, use_init_models=True)
+
+
+def test_cross_validation_use_fitted_transfer_learning():
+    """`cross_validation(use_fitted=True)` reuses fitted weights and refits scalers.
+
+    `cross_validation(refit=False)` always retrained the model on the holdout dataset, 
+    and `local_scaler_type` raised a series-count mismatch when the holdout had a different
+    number of series than the training set.
+    """
+    h = 5
+    master = generate_series(5, min_length=200, max_length=200, equal_ends=True)
+    holdout = generate_series(
+        3, min_length=200, max_length=200, equal_ends=True, seed=42
+    ).copy()
+    holdout["unique_id"] = ("h_" + holdout["unique_id"].astype(str)).astype("category")
+    holdout["y"] = holdout["y"] + 1000.0
+
+    nf = NeuralForecast(
+        models=[
+            MLP(
+                input_size=2 * h,
+                h=h,
+                scaler_type=None,
+                max_steps=5,
+                val_check_steps=5,
+                enable_progress_bar=False,
+            )
+        ],
+        freq="D",
+        local_scaler_type="standard",
+    )
+    nf.fit(master)
+
+    fitted_weights = {
+        k: v.detach().clone() for k, v in nf.models[0].state_dict().items()
+    }
+    fitted_uids = list(nf.uids)
+    fitted_scalers = nf.scalers_
+
+    cv_df = nf.cross_validation(
+        df=holdout,
+        n_windows=3,
+        step_size=1,
+        refit=False,
+        use_fitted=True,
+    )
+
+    assert set(cv_df["unique_id"].unique()) == set(holdout["unique_id"].unique())
+    assert cv_df["cutoff"].nunique() == 3
+    assert "MLP" in cv_df.columns
+    assert not cv_df["MLP"].isna().any()
+
+    for k, v in nf.models[0].state_dict().items():
+        torch.testing.assert_close(
+            fitted_weights[k],
+            v,
+            msg=lambda m, k=k: f"Weight {k} changed during use_fitted CV: {m}",
+        )
+
+    assert list(nf.uids) == fitted_uids
+    assert nf.scalers_ is fitted_scalers
+
+    master_preds = nf.predict()
+    assert set(master_preds["unique_id"].unique()) == set(master["unique_id"].unique())
+
+
+def test_cross_validation_use_fitted_restores_state_on_exception():
+    """If CV raises mid-way, fitted state must still be restored (try/finally)."""
+    h = 5
+    master = generate_series(4, min_length=120, max_length=120, equal_ends=True)
+    holdout = generate_series(
+        2, min_length=120, max_length=120, equal_ends=True, seed=7
+    ).copy()
+    holdout["unique_id"] = ("h_" + holdout["unique_id"].astype(str)).astype("category")
+
+    nf = NeuralForecast(
+        models=[
+            MLP(
+                input_size=2 * h,
+                h=h,
+                scaler_type=None,
+                max_steps=2,
+                val_check_steps=2,
+                enable_progress_bar=False,
+            )
+        ],
+        freq="D",
+        local_scaler_type="standard",
+    )
+    nf.fit(master)
+
+    fitted_uids = list(nf.uids)
+    fitted_scalers = nf.scalers_
+    fitted_dataset = nf.dataset
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated failure")
+
+    nf.models[0].predict = _boom
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        nf.cross_validation(df=holdout, n_windows=2, refit=False, use_fitted=True)
+
+    assert list(nf.uids) == fitted_uids
+    assert nf.scalers_ is fitted_scalers
+    assert nf.dataset is fitted_dataset
+
+
+def test_cross_validation_use_fitted_validation_errors():
+    """`use_fitted=True` rejects incompatible argument combinations."""
+    h = 5
+    series = generate_series(3, min_length=100, max_length=100, equal_ends=True)
+    nf = NeuralForecast(
+        models=[
+            MLP(
+                input_size=2 * h,
+                h=h,
+                scaler_type=None,
+                max_steps=2,
+                val_check_steps=2,
+                enable_progress_bar=False,
+            )
+        ],
+        freq="D",
+    )
+
+    with pytest.raises(ValueError, match="requires a model previously fitted"):
+        nf.cross_validation(df=series, n_windows=1, use_fitted=True)
+
+    nf.fit(series)
+
+    with pytest.raises(ValueError, match="only supported with `refit=False`"):
+        nf.cross_validation(df=series, n_windows=1, use_fitted=True, refit=True)
+
+    with pytest.raises(ValueError, match="cannot be combined with `use_init_models"):
+        nf.cross_validation(
+            df=series, n_windows=1, use_fitted=True, use_init_models=True
+        )
+
+    with pytest.raises(ValueError, match="prediction_intervals"):
+        nf.cross_validation(
+            df=series,
+            n_windows=1,
+            use_fitted=True,
+            prediction_intervals=PredictionIntervals(),
+        )
+
+    # Even when the user doesn't pass prediction_intervals to cross_validation,
+    # a prior fit(prediction_intervals=...) leaves them on `self`; conformal
+    # downstream logic would still activate, so use_fitted must reject this too.
+    nf.prediction_intervals = PredictionIntervals()
+    with pytest.raises(ValueError, match="prediction_intervals"):
+        nf.cross_validation(df=series, n_windows=1, use_fitted=True)
+    nf.prediction_intervals = None
+
+
 def test_neural_forecast_boxcox_scaling(setup_airplane_data):
     """Test BoxCox scaling functionality for NeuralForecast models."""
     AirPassengersPanel_train, _ = setup_airplane_data
@@ -341,6 +739,118 @@ def test_neural_forecast_boxcox_scaling(setup_airplane_data):
         insample_res["y_expected"].values,
         rtol=0.7,
     )
+
+
+# Test static exogenous feature scaling
+
+@pytest.fixture
+def config() -> dict:
+    return {
+        'h': 12,
+        'input_size': 24,
+        'max_steps': 10,
+    }
+
+
+@pytest.mark.parametrize("scaler", _type2scaler.keys())
+def test_neural_forecast_static_scaling(config, scaler):
+    """Test static scaling functionality for NeuralForecast models."""
+    stat_exog = ['airline1', 'airline2']
+    nf = NeuralForecast(models=[NHITS(**config, stat_exog_list=stat_exog)], freq="D")
+    nf.fit(AirPassengersPanel, AirPassengersStatic)
+    without_scaler = nf.predict()
+
+    nf = NeuralForecast(models=[NHITS(**config, stat_exog_list=stat_exog)], freq="D", local_static_scaler_type=scaler)
+    nf.fit(AirPassengersPanel, AirPassengersStatic)
+    with_scaler = nf.predict()
+
+    np.testing.assert_allclose(
+        without_scaler["NHITS"].values,
+        with_scaler["NHITS"].values,
+        rtol=0.2,
+    )
+
+
+@pytest.fixture
+def data(size=300, n_series=3) -> pd.DataFrame:
+    return pd.DataFrame({
+        "unique_id": (['store_1'] * (size // n_series) + ['store_2'] * (size // n_series) + ['store_3'] * (size // n_series)),
+        "ds": np.tile(pd.date_range(start="2020-01-01", periods=size // n_series, freq="D").to_numpy(), n_series),
+        "y": np.random.rand(size),
+    })
+
+
+@pytest.fixture
+def static_data(n_series=3) -> pd.DataFrame:
+    return pd.DataFrame({
+        "unique_id": [f'store_{i+1}' for i in range(n_series)],
+        "size": np.random.randint(50, 500, size=n_series),
+        "num_days_open": np.random.randint(100, 1000, size=n_series),
+    })
+
+
+@pytest.mark.parametrize("scaler", _type2scaler.keys())
+def test_normalization_of_static_exog(data, static_data, config, scaler):
+    models = [TFT(**config, stat_exog_list=["size", "num_days_open"])]
+    nf = NeuralForecast(models=models, freq="D", local_static_scaler_type=scaler)
+    
+    dataset = TimeSeriesDataset.from_df(data, static_data)[0]
+    nf._scalers_fit_transform(dataset)
+    fit_dataset = dataset.static
+    
+    dataset = TimeSeriesDataset.from_df(data, static_data)[0]
+    nf._scalers_transform(dataset)
+    predict_dataset = dataset.static
+
+    assert (fit_dataset == predict_dataset).all()
+
+
+def test_standard_normalization_of_static_exog(data, static_data, config):
+    models = [TFT(**config, stat_exog_list=["size", "num_days_open"])]
+    nf = NeuralForecast(models=models, freq="D", local_static_scaler_type="standard")
+    
+    dataset = TimeSeriesDataset.from_df(data, static_data)[0]
+    nf._scalers_fit_transform(dataset)
+    normalized_static = dataset.static.numpy()
+
+    for i, col in enumerate(dataset.static_cols):
+        col_values = static_data[col].values.reshape(-1, 1).astype(np.float32)
+        mean = col_values.mean()
+        std = col_values.std()
+        expected_normalized = (col_values - mean) / std
+
+        np.testing.assert_allclose(nf.static_scalers_[col].stats_[:, 0], mean, rtol=1e-5)
+        np.testing.assert_allclose(nf.static_scalers_[col].stats_[:, 1], std, rtol=1e-5)
+        np.testing.assert_allclose(
+            normalized_static[:, i],
+            expected_normalized.flatten(),
+            rtol=1e-5,
+        )
+
+
+def test_minmax_normalization_of_static_exog(data, static_data, config):
+    models = [TFT(**config, stat_exog_list=["size", "num_days_open"])]
+    nf = NeuralForecast(models=models, freq="D", local_static_scaler_type="minmax")
+    
+    dataset = TimeSeriesDataset.from_df(data, static_data)[0]
+    nf._scalers_fit_transform(dataset)
+    normalized_static = dataset.static.numpy()
+
+    for i, col in enumerate(dataset.static_cols):
+        col_values = static_data[col].values.reshape(-1, 1).astype(np.float32)
+        min_val = col_values.min()
+        range_val = col_values.max() - min_val
+        expected_normalized = (col_values - min_val) / range_val
+
+        np.testing.assert_allclose(nf.static_scalers_[col].stats_[:, 0], min_val, rtol=1e-5)
+        np.testing.assert_allclose(nf.static_scalers_[col].stats_[:, 1], range_val, rtol=1e-5)
+        np.testing.assert_allclose(
+            normalized_static[:, i],
+            expected_normalized.flatten(),
+            rtol=1e-5,
+        )
+
+
 # test futr_df contents
 def test_future_df_contents(setup_airplane_data):
     AirPassengersPanel_train, AirPassengersPanel_test = setup_airplane_data
@@ -549,7 +1059,7 @@ def test_aliases(setup_airplane_data):
     }
     models = [
         # test Auto
-        AutoDilatedRNN(h=12, config=config_drnn, cpus=1, num_samples=2, alias="AutoDIL"),
+        AutoDilatedRNN(h=12, config=config_drnn, ray_options=RayOptions(cpus=1), num_samples=2, alias="AutoDIL"),
         # test BaseWindows
         NHITS(h=12, input_size=24, loss=MQLoss(level=[80]), max_steps=1, alias="NHITSMQ"),
         # test BaseRecurrent
@@ -624,7 +1134,7 @@ def test_training_with_an_iterative_dataset(setup_airplane_data):
             backend="optuna",
             search_alg=optuna.samplers.TPESampler(seed=0),
         ),  # type: ignore
-        AutoNBEATSx(h=12, config=config_ray, cpus=1, num_samples=2),
+        AutoNBEATSx(h=12, config=config_ray, ray_options=RayOptions(cpus=1), num_samples=2),
     ]
     nf = NeuralForecast(models=models, freq="M")
 
@@ -690,7 +1200,7 @@ def test_cross_validation(h=12, test_size=12):
     }
     fcst = NeuralForecast(
         models=[
-            AutoDilatedRNN(h=12, config=config_drnn, cpus=1, num_samples=1),
+            AutoDilatedRNN(h=12, config=config_drnn, ray_options=RayOptions(cpus=1), num_samples=1),
             DilatedRNN(h=12, input_size=-1, encoder_hidden_size=5, max_steps=1),
             RNN(
                 h=12,
@@ -710,7 +1220,7 @@ def test_cross_validation(h=12, test_size=12):
                 futr_exog_list=["trend"],
                 hist_exog_list=["y_[lag12]"],
             ),
-            AutoMLP(h=12, config=config, cpus=1, num_samples=1),
+            AutoMLP(h=12, config=config, ray_options=RayOptions(cpus=1), num_samples=1),
             MLP(h=12, input_size=12, max_steps=1, scaler_type="robust"),
             NBEATSx(
                 h=12,
@@ -755,7 +1265,7 @@ def test_cross_validation(h=12, test_size=12):
     # cross validation
     fcst = NeuralForecast(
         models=[
-            AutoDilatedRNN(h=12, config=config_drnn, cpus=1, num_samples=1),
+            AutoDilatedRNN(h=12, config=config_drnn, ray_options=RayOptions(cpus=1), num_samples=1),
             DilatedRNN(h=12, input_size=-1, encoder_hidden_size=5, max_steps=1),
             RNN(
                 h=12,
@@ -775,7 +1285,7 @@ def test_cross_validation(h=12, test_size=12):
                 futr_exog_list=["trend"],
                 hist_exog_list=["y_[lag12]"],
             ),
-            AutoMLP(h=12, config=config, cpus=1, num_samples=1),
+            AutoMLP(h=12, config=config, ray_options=RayOptions(cpus=1), num_samples=1),
             MLP(h=12, input_size=12, max_steps=1, scaler_type="robust"),
             NBEATSx(
                 h=12,
@@ -868,9 +1378,9 @@ def test_save_load(setup_airplane_data):
 
     fcst = NeuralForecast(
         models=[
-            AutoRNN(h=12, config=config_drnn, cpus=1, num_samples=2, refit_with_val=True),
+            AutoRNN(h=12, config=config_drnn, ray_options=RayOptions(cpus=1), num_samples=2, refit_with_val=True),
             DilatedRNN(h=12, input_size=-1, encoder_hidden_size=5, max_steps=1),
-            AutoMLP(h=12, config=config, cpus=1, num_samples=2),
+            AutoMLP(h=12, config=config, ray_options=RayOptions(cpus=1), num_samples=2),
             NHITS(
                 h=12,
                 input_size=12,
@@ -907,7 +1417,11 @@ def test_save_load(setup_airplane_data):
 def test_save_load_no_dataset(setup_airplane_data):
     AirPassengersPanel_train, AirPassengersPanel_test = setup_airplane_data
 
-    shutil.rmtree("examples/debug_run")
+    try:
+        shutil.rmtree("examples/debug_run")
+    except:
+        print("Directory does not exist")
+
     fcst = NeuralForecast(
         models=[DilatedRNN(h=12, input_size=-1, encoder_hidden_size=5, max_steps=1)],
         freq="M",
@@ -920,6 +1434,75 @@ def test_save_load_no_dataset(setup_airplane_data):
     fcst2 = NeuralForecast.load(path="./examples/debug_run/")
     forecasts2 = fcst2.predict(df=AirPassengersPanel_train, futr_df=AirPassengersPanel_test)
     np.testing.assert_allclose(forecasts1["DilatedRNN"], forecasts2["DilatedRNN"])
+
+
+def test_save_load_with_callbacks(setup_airplane_data, tmp_path):
+    """Saving a model with trainer callbacks should not break predict after reload.
+
+    Custom callbacks are not YAML-serializable; without the fix this causes a
+    ValueError when PyTorch Lightning's logger tries to log hparams during predict.
+    """
+    from pytorch_lightning.callbacks import Callback
+
+    class _NonYamlCallback(Callback):
+        # lambda attributes are not YAML-safe
+        fn = lambda self: None  # noqa: E731
+
+    AirPassengersPanel_train, _ = setup_airplane_data
+    model = NHITS(
+        h=12,
+        input_size=24,
+        max_steps=10,
+        callbacks=[_NonYamlCallback()],
+    )
+    nf = NeuralForecast(models=[model], freq="M")
+    nf.fit(AirPassengersPanel_train)
+    nf.save(str(tmp_path))
+
+    nf2 = NeuralForecast.load(str(tmp_path))
+    # Should not raise a ValueError from YAML serialization
+    preds = nf2.predict(df=AirPassengersPanel_train)
+    assert preds is not None
+
+
+def test_save_skips_nonzero_ddp_rank(monkeypatch, tmp_path):
+    """Only rank 0 should write artifacts when DDP is initialized."""
+    dist = pytest.importorskip("torch.distributed")
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+
+    fcst = NeuralForecast(
+        models=[DilatedRNN(h=12, input_size=-1, encoder_hidden_size=5, max_steps=1)],
+        freq="M",
+    )
+    save_path = tmp_path / "ddp_rank_1_save"
+    fcst.save(path=str(save_path), model_index=None, overwrite=True, save_dataset=False)
+
+    assert not save_path.exists()
+
+
+def test_save_runs_on_rank0_ddp(monkeypatch, tmp_path, setup_airplane_data):
+    """Rank-0 DDP process must save all artifacts normally."""
+    dist = pytest.importorskip("torch.distributed")
+
+    AirPassengersPanel_train, _ = setup_airplane_data
+    fcst = NeuralForecast(
+        models=[DilatedRNN(h=12, input_size=-1, encoder_hidden_size=5, max_steps=1)],
+        freq="M",
+    )
+    fcst.fit(AirPassengersPanel_train)
+
+    save_path = tmp_path / "ddp_rank_0_save"
+    with monkeypatch.context() as m:
+        m.setattr(dist, "is_initialized", lambda: True)
+        m.setattr(dist, "get_rank", lambda: 0)
+        fcst.save(
+            path=str(save_path), model_index=None, overwrite=False, save_dataset=False
+        )
+
+    assert save_path.exists()
+    assert (save_path / "alias_to_model.pkl").exists()
+    assert (save_path / "configuration.pkl").exists()
 
 # test `enable_checkpointing=True` should generate chkpt
 def test_enable_checkpointing(setup_airplane_data):
@@ -1038,6 +1621,51 @@ def test_order_of_variables_no_effect_on_val_loss(setup_airplane_data, scaler_ty
     assert valid_losses[-1][1] < 40, "Validation loss is too high"
     assert valid_losses[-1][1] > 10, "Validation loss is too low"
 
+
+def test_val_df_parameter_validation(setup_airplane_data):
+    AirPassengersPanel_train, _ = setup_airplane_data
+    nf = NeuralForecast(
+        models=[NHITS(h=12, input_size=24, max_steps=1)], freq="M"
+    )
+    val_df = (
+        AirPassengersPanel_train.groupby("unique_id", observed=True)
+        .tail(12)
+        .reset_index(drop=True)
+    )
+    with pytest.raises(ValueError, match="val_df and val_size cannot be set together"):
+        nf.fit(AirPassengersPanel_train, val_size=12, val_df=val_df)
+
+
+def test_val_df_equivalence_with_val_size(setup_airplane_data):
+    # Splitting off the last 12 rows per series as val_df and passing them
+    # explicitly must produce the same valid_trajectories as using val_size=12
+    # on the full training DataFrame (same combined dataset, same random seed).
+    AirPassengersPanel_train, _ = setup_airplane_data
+    val_size = 12
+
+    train_df = (
+        AirPassengersPanel_train.groupby("unique_id", observed=True)
+        .apply(lambda x: x.iloc[:-val_size])
+        .reset_index(drop=True)
+    )
+    val_df = (
+        AirPassengersPanel_train.groupby("unique_id", observed=True)
+        .tail(val_size)
+        .reset_index(drop=True)
+    )
+
+    model_kwargs = dict(h=12, input_size=24, max_steps=10, random_seed=42)
+
+    nf_val_size = NeuralForecast(models=[NHITS(**model_kwargs)], freq="M")
+    nf_val_size.fit(AirPassengersPanel_train, val_size=val_size)
+
+    nf_val_df = NeuralForecast(models=[NHITS(**model_kwargs)], freq="M")
+    nf_val_df.fit(train_df, val_df=val_df)
+
+    losses_val_size = nf_val_size.models[0].valid_trajectories
+    losses_val_df = nf_val_df.models[0].valid_trajectories
+
+    np.testing.assert_allclose(losses_val_size, losses_val_df, atol=1e-4)
 
 
 @pytest.mark.parametrize("model,expected_error", [
@@ -1550,6 +2178,69 @@ def test_neuralforecast_conformal_prediction(setup_airplane_data, setup_airplane
     assert "uid" in preds.columns
     assert any(col.startswith(model.__name__) for col in preds.columns)
 
+@pytest.mark.parametrize("backend", ["optuna", "ray"])
+@pytest.mark.parametrize("use_init_models", [False, True])
+def test_auto_model_prediction_intervals_runs_search_once(
+    setup_airplane_data, monkeypatch, backend, use_init_models
+):
+    """Auto model with prediction_intervals must not re-run the hyperparameter search
+    after `_conformity_scores` already ran it. With `use_init_models=True`,
+    `_reset_models` swaps in fresh clones, so the captured search results must be
+    restored onto them or the search runs twice."""
+    from neuralforecast.common._base_auto import BaseAuto
+
+    AirPassengersPanel_train, _ = setup_airplane_data
+
+    if backend == "optuna":
+        def config(trial):
+            return {
+                "input_size": trial.suggest_categorical("input_size", [12]),
+                "max_steps": 1,
+                "val_check_steps": 1,
+                "hidden_size": trial.suggest_categorical("hidden_size", [8, 16]),
+            }
+
+        tune_method = "_optuna_tune_model"
+        auto_kwargs = dict(
+            config=config,
+            search_alg=optuna.samplers.TPESampler(seed=0),
+        )
+    else:
+        config = {
+            "input_size": tune.choice([12]),
+            "max_steps": 1,
+            "val_check_steps": 1,
+            "hidden_size": tune.choice([8, 16]),
+        }
+        tune_method = "_tune_model"
+        auto_kwargs = dict(config=config, ray_options=RayOptions(cpus=1))
+
+    call_count = {"n": 0}
+    original = getattr(BaseAuto, tune_method)
+
+    def counting(self, *args, **kwargs):
+        call_count["n"] += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(BaseAuto, tune_method, counting)
+
+    nf = NeuralForecast(
+        models=[AutoMLP(h=12, num_samples=2, backend=backend, **auto_kwargs)],
+        freq="M",
+    )
+    nf.fit(
+        AirPassengersPanel_train,
+        prediction_intervals=PredictionIntervals(n_windows=2),
+        use_init_models=use_init_models,
+    )
+
+    assert call_count["n"] == 1, (
+        f"{backend} hyperparameter search ran {call_count['n']} times with "
+        f"use_init_models={use_init_models}, expected 1 (issue #1232; search results "
+        "must survive _reset_models)"
+    )
+
+
 def test_neuralforecast_cross_validation_conformal_prediction(setup_airplane_data):
     """Test cross validation can support conformal prediction with proper refit parameter."""
     AirPassengersPanel_train, _ = setup_airplane_data
@@ -1721,11 +2412,9 @@ def test_explainability(explainer, use_polars, horizons, recursive_horizon):
     
     for model in models:
         model_name = model.alias or model.__class__.__name__
-        
+
         # Check skip conditions
-        if model.MULTIVARIATE:
-            skipped_models.add(model_name)
-        elif hasattr(model.loss, 'is_distribution_output') and model.loss.is_distribution_output:
+        if hasattr(model.loss, 'is_distribution_output') and model.loss.is_distribution_output:
             skipped_models.add(model_name)
         elif model.RECURRENT and explainer == ExplainerEnum.IntegratedGradients:
             skipped_models.add(model_name)
@@ -1745,13 +2434,19 @@ def test_explainability(explainer, use_polars, horizons, recursive_horizon):
     # Test explained model
     for model_name in expected_explanations:
         expl = explanations[model_name]
+        model_obj = next(m for m in models if (m.alias or m.__class__.__name__) == model_name)
+
+        # Multivariate shape assertions are covered by test_explainability_multivariate
+        if model_obj.MULTIVARIATE:
+            assert expl["insample"] is not None
+            continue
 
         # Basic structure tests
         assert expl["insample"] is not None
         expected_input_size = input_size
         if model_name == "LSTM-recurrent":
             expected_input_size = input_size + h_train
-        
+
         batch_size = n_series
         n_series_ = 1
         expected_insample_shape = (
@@ -1780,34 +2475,33 @@ def test_explainability(explainer, use_polars, horizons, recursive_horizon):
             
         
         # Check exogenous if model has them
-        model = next(m for m in models if (m.alias or m.__class__.__name__) == model_name)
-        if model.futr_exog_list:
+        if model_obj.futr_exog_list:
             if recursive_horizon:
-                futr_temporal_size = model.input_size + model.h
+                futr_temporal_size = model_obj.input_size + model_obj.h
             else:
-                futr_temporal_size = model.input_size + h
+                futr_temporal_size = model_obj.input_size + h
             expected_futr_shape = (
-                batch_size,                 # batch size
-                len(horizons),              # horizons
-                n_series_,                  # n_series (1 for univariate)
-                len(outputs),               # n_outputs
-                futr_temporal_size,         # n_input_steps (past + future)
-                len(model.futr_exog_list),  # number of features
+                batch_size,                     # batch size
+                len(horizons),                  # horizons
+                n_series_,                      # n_series (1 for univariate)
+                len(outputs),                   # n_outputs
+                len(model_obj.futr_exog_list),  # number of features
+                futr_temporal_size,             # n_input_steps (past + future)
             )
             assert expl["futr_exog"] is not None
             assert expl["futr_exog"].shape == expected_futr_shape
-        if model.hist_exog_list:
+        if model_obj.hist_exog_list:
             expected_hist_shape = (
-                batch_size,                # batch size
-                len(horizons),             # horizons
-                n_series_,                 # n_series (1 for univariate)
-                len(outputs),              # n_outputs
-                model.input_size,          # n_input_steps (past)
-                len(model.hist_exog_list), # number of features
+                batch_size,                     # batch size
+                len(horizons),                  # horizons
+                n_series_,                      # n_series (1 for univariate)
+                len(outputs),                   # n_outputs
+                len(model_obj.hist_exog_list),  # number of features
+                model_obj.input_size,           # n_input_steps (past)
             )
             assert expl["hist_exog"] is not None
             assert expl["hist_exog"].shape == expected_hist_shape
-        if model.stat_exog_list:
+        if model_obj.stat_exog_list:
             expected_stat_shape = (
                 batch_size,    # batch size
                 len(horizons), # horizons
@@ -1818,36 +2512,360 @@ def test_explainability(explainer, use_polars, horizons, recursive_horizon):
             assert expl["stat_exog"] is not None
             assert expl["stat_exog"].shape == expected_stat_shape
 
-def _test_model_additivity(preds_df, expl, model_name, use_polars, n_series, h, horizons):
-    """Test if sum of attributions and baseline predictions equal forecasts"""
+def _test_model_additivity(preds_df, expl, model_name, use_polars, n_series, h, horizons, rtol=1e-3, is_multivariate=None):
+    """Test if sum of attributions and baseline predictions equal forecasts.
+
+    Works for both univariate (n_series=1) and multivariate (n_series>1) models.
+    For multivariate, attributions retain the n_series_out dimension so additivity
+    holds per series (baseline + sum(attrs) == prediction for each series).
+
+    is_multivariate can be passed explicitly for the partial-series case where
+    n_series_out=1 but the model is still multivariate (series=[0] selection).
+    """
     pred_col = [col for col in preds_df.columns if col.startswith(model_name)][0]
     if use_polars:
         preds = preds_df[pred_col].to_numpy()
     else:
         preds = preds_df[pred_col].values
 
-    # Sum over n_outputs (-1) and n_series (-2), shape (batch_size, h, n_series, n_outputs) -> (batch_size, h)
-    baseline = expl["baseline_predictions"].sum(dim=(-1, -2))  
-    
-    # Sum over channels (-1), input_sequence (-2), n_outputs (-3), n_series (-4)
-    sum_dims = (-1, -2, -3, -4) 
-    insample_attr = expl["insample"].sum(dim=sum_dims)
-    futr_attr = expl["futr_exog"].sum(dim=sum_dims) if not isinstance(expl["futr_exog"], list) else 0
-    hist_attr = expl["hist_exog"].sum(dim=sum_dims) if not isinstance(expl["hist_exog"], list) else 0
-    
-    # Static doesn't have the input_sequence dimension, as it is static across that dimension
-    sum_dims = (-1, -2, -3)  # Sum over channels (-1), n_outputs (-2), n_series (-3)
-    stat_attr = expl["stat_exog"].sum(dim=sum_dims) if not isinstance(expl["stat_exog"], list) else 0
-    
-    total_attr = insample_attr + futr_attr + hist_attr + stat_attr
-    pred_from_attr = baseline + total_attr  # Shape: (n_series, h)
+    # Detect multivariate via the n_series_out dimension of baseline_predictions,
+    # unless the caller overrides (needed when series=[0] gives n_series_out=1).
+    if is_multivariate is None:
+        is_multivariate = expl["baseline_predictions"].shape[2] > 1
 
-    preds = preds.reshape(n_series, h)
+    if is_multivariate:
+        # Keep n_series_out: (1, h, n_series, 1) -> sum over n_outputs -> (1, h, n_series)
+        baseline = expl["baseline_predictions"].sum(dim=-1)
+    else:
+        # (1, h, 1, 1) -> sum over n_outputs and n_series -> (1, h)
+        baseline = expl["baseline_predictions"].sum(dim=(-1, -2))
+
+    # Sum over all feature dims, keeping (batch, h[, n_series]) shape
+    sum_dims = (-1, -2, -3, -4)
+    insample_attr = expl["insample"].sum(dim=sum_dims)
+    futr_attr = expl["futr_exog"].sum(dim=sum_dims) if expl["futr_exog"] is not None else 0
+    hist_attr = expl["hist_exog"].sum(dim=sum_dims) if expl["hist_exog"] is not None else 0
+
+    # Static doesn't have the input_sequence dimension
+    sum_dims_stat = (-1, -2, -3)
+    stat_attr = expl["stat_exog"].sum(dim=sum_dims_stat) if expl["stat_exog"] is not None else 0
+
+    total_attr = insample_attr + futr_attr + hist_attr + stat_attr
+
+    if is_multivariate:
+        # (1, h, n_series_out) -> (n_series_out, h)
+        pred_from_attr = (baseline + total_attr).squeeze(0).T
+        # preds_df always has all n_series rows; take only the first n_series_out
+        # to match a partial-series explanation (e.g. series=[0]).
+        n_series_out = pred_from_attr.shape[0]
+        preds = preds.reshape(-1, h)[:n_series_out, :]
+    else:
+        pred_from_attr = baseline + total_attr  # (1, h)
+        preds = preds.reshape(n_series, h)
+
     preds = preds[:, horizons]
 
     np.testing.assert_allclose(
         pred_from_attr.cpu().numpy(),
         preds,
-        rtol=1e-3,
+        rtol=rtol,
         err_msg="Attribution predictions do not match model predictions"
     )
+
+def test_explainability_multivariate():
+    """Test that explanations work for multivariate models with all exogenous types (MLPMultivariate)."""
+    Y_train_df = AirPassengersPanel[
+        AirPassengersPanel["ds"] < AirPassengersPanel["ds"].values[-12]
+    ].reset_index(drop=True)
+    Y_test_df = AirPassengersPanel[
+        AirPassengersPanel["ds"] >= AirPassengersPanel["ds"].values[-12]
+    ].reset_index(drop=True)
+    futr_df = Y_test_df.drop(columns=["y", "y_[lag12]"])
+    static_df = AirPassengersStatic.drop(columns=["airline2"])
+
+    h = 12
+    input_size = 24
+    n_series = Y_train_df["unique_id"].nunique()  # 2
+    n_futr = 1   # "trend"
+    n_hist = 1   # "y_[lag12]"
+
+    # MLPMultivariate: piecewise-linear (ReLU), no RevIN, so IG integration is nearly exact
+    model = MLPMultivariate(
+        h=h,
+        input_size=input_size,
+        n_series=n_series,
+        futr_exog_list=["trend"],
+        hist_exog_list=["y_[lag12]"],
+        stat_exog_list=["airline1"],
+        max_steps=2,
+        accelerator="cpu",
+    )
+    nf = NeuralForecast(models=[model], freq="ME")
+    nf.fit(df=Y_train_df, static_df=static_df)
+
+    horizons = list(range(h))
+    outputs = [0]
+    preds_df, explanations = nf.explain(
+        outputs=outputs,
+        horizons=horizons,
+        futr_df=futr_df,
+        static_df=static_df,
+        explainer=ExplainerEnum.IntegratedGradients,
+    )
+
+    assert "MLPMultivariate" in explanations
+    expl = explanations["MLPMultivariate"]
+
+    # For multivariate: batch_size=1 (all series processed in one window).
+    # insample gets an extra n_series_in dim for cross-series attributions.
+    assert expl["insample"] is not None
+    assert expl["insample"].shape == (
+        1,           # batch_size
+        h,           # n_horizons
+        n_series,    # n_series_out
+        1,           # n_outputs
+        input_size,  # time steps
+        n_series,    # n_series_in (cross-series attributions)
+        2,           # (y attribution, mask attribution)
+    )
+
+    # futr_exog: [Ws, F, L+h, n_series_in]
+    assert expl["futr_exog"] is not None
+    assert expl["futr_exog"].shape == (
+        1,                    # batch_size
+        h,                    # n_horizons
+        n_series,             # n_series_out
+        1,                    # n_outputs
+        n_futr,               # n_futr_features
+        input_size + h,       # time steps (past + future)
+        n_series,             # n_series_in
+    )
+
+    # hist_exog: [Ws, X, L, n_series_in]
+    assert expl["hist_exog"] is not None
+    assert expl["hist_exog"].shape == (
+        1,           # batch_size
+        h,           # n_horizons
+        n_series,    # n_series_out
+        1,           # n_outputs
+        n_hist,      # n_hist_features
+        input_size,  # time steps (past only)
+        n_series,    # n_series_in
+    )
+
+    n_stat = 1   # "airline1"
+    # stat_exog: [Ws, h, n_series_out, n_outputs, n_series_in, S]
+    # stat_exog is flattened to [1, n_series * S] for captum, then reshaped back.
+    assert expl["stat_exog"] is not None
+    assert expl["stat_exog"].shape == (
+        1,        # batch_size
+        h,        # n_horizons
+        n_series, # n_series_out
+        1,        # n_outputs
+        n_series, # n_series_in (cross-series static attributions)
+        n_stat,   # n_static_features
+    )
+
+    assert expl["baseline_predictions"] is not None
+    assert expl["baseline_predictions"].shape == (1, h, n_series, 1)
+
+    # MLPMultivariate is piecewise linear (ReLU), so IG integration is nearly exact
+    # and the default tight tolerance holds.
+    _test_model_additivity(preds_df, expl, "MLPMultivariate", False, n_series, h, horizons)
+
+    # --- Partial series selection: series=[0] ---
+    preds_df_s0, explanations_s0 = nf.explain(
+        outputs=outputs,
+        horizons=horizons,
+        series=[0],
+        futr_df=futr_df,
+        static_df=static_df,
+        explainer=ExplainerEnum.IntegratedGradients,
+    )
+    expl_s0 = explanations_s0["MLPMultivariate"]
+
+    # n_series_out is 1; n_series_in is still n_series (cross-series captured)
+    assert expl_s0["insample"].shape == (1, h, 1, 1, input_size, n_series, 2)
+    assert expl_s0["futr_exog"].shape == (1, h, 1, 1, n_futr, input_size + h, n_series)
+    assert expl_s0["hist_exog"].shape == (1, h, 1, 1, n_hist, input_size, n_series)
+    assert expl_s0["stat_exog"].shape == (1, h, 1, 1, n_series, n_stat)
+    assert expl_s0["baseline_predictions"].shape == (1, h, 1, 1)
+
+    # Additivity holds for the single selected series; pass is_multivariate=True
+    # because n_series_out=1 would otherwise be misdetected as univariate.
+    _test_model_additivity(preds_df_s0, expl_s0, "MLPMultivariate", False, 1, h, horizons, is_multivariate=True)
+
+    # --- Invalid series index raises ValueError ---
+    with pytest.raises(ValueError, match="Invalid series indices"):
+        nf.explain(
+            outputs=outputs,
+            horizons=horizons,
+            series=[5],
+            futr_df=futr_df,
+            static_df=static_df,
+        )
+
+
+
+def test_compute_valid_loss_distribution_to_quantile_scale():
+    """
+    Test that when training with DistributionLoss and validating with 
+    quantile-based losses, the validation loss is computed on the original scale.
+    """
+    loss = DistributionLoss(distribution='StudentT', level=[80, 90])
+    
+    # Simulate normalized model output (mean ~0, scale ~1)
+    batch_size, horizon, n_series = 2, 12, 1
+    raw_output = (
+        torch.ones(batch_size, horizon, n_series) * 5,    
+        torch.zeros(batch_size, horizon, n_series),       # mean (normalized)
+        torch.zeros(batch_size, horizon, n_series),       # scale (normalized)
+    )
+    
+    # Simulate real data statistics
+    loc = torch.ones(batch_size, horizon, n_series) * 400
+    scale = torch.ones(batch_size, horizon, n_series) * 100
+    
+    # Apply scale_decouple (transforms distribution params to original scale)
+    distr_args = loss.scale_decouple(raw_output, loc=loc, scale=scale)
+    
+    # Sample quantiles
+    _, _, quants = loss.sample(distr_args)
+    
+    # Target would be in original scale (around loc)
+    target_mean = loc.mean().item()
+    quants_mean = quants.mean().item()
+    
+    ratio = quants_mean / target_mean
+    
+    # Ratio should be close to 1 - quantiles and target on same scale
+    assert 0.8 < ratio < 1.2, (
+        f"Quantiles mean ({quants_mean:.2f}) and target mean ({target_mean:.2f}) "
+        f"are not on the same scale. Ratio: {ratio:.2f}"
+    )
+
+
+def test_mase_validation_loss_scale(setup_airplane_data):
+    """Test that MASE validation loss is correctly computed with proper scaling.
+
+    This test verifies the fix for the scale mismatch bug where insample_y
+    was in normalized scale while outsample_y and y_hat were in original scale.
+    With the fix, all values passed to MASE should be in the same (original) scale.
+    """
+    AirPassengersPanel_train, _ = setup_airplane_data
+
+    # Use MLP with standard scaler and MASE validation loss
+    model = MLP(
+        h=12,
+        input_size=24,
+        loss=MAE(),
+        valid_loss=MASE(seasonality=12),
+        scaler_type="standard",
+        max_steps=5,
+        val_check_steps=1,
+    )
+    nf = NeuralForecast(models=[model], freq="M")
+
+    # Fit with validation set
+    nf.fit(AirPassengersPanel_train, val_size=12)
+
+    # Get validation loss from trajectories (access fitted model from nf.models)
+    fitted_model = nf.models[0]
+    valid_trajectories = fitted_model.valid_trajectories
+    assert len(valid_trajectories) > 0, "No validation trajectories recorded"
+
+    _, valid_loss = valid_trajectories[-1]
+
+    # With the fix, MASE should be reasonable (< 50 for a minimally trained model)
+    # Before the fix, MASE was ~200+ due to scale mismatch
+    assert valid_loss < 50, (
+        f"MASE validation loss is {valid_loss}, which indicates the scale mismatch "
+        f"bug may have regressed. Expected < 50 for a properly scaled MASE."
+    )
+
+
+@pytest.mark.parametrize("loss,valid_loss", [
+    # DistributionLoss uses NLL — mismatched levels are allowed
+    (DistributionLoss(distribution="Normal", level=[80, 90]), DistributionLoss(distribution="Normal", level=[50])),
+    # GMM + sCRPS with matching quantiles
+    (GMM(n_components=5, level=[80, 90]), sCRPS(level=[80, 90])),
+    # MQLoss with matching quantiles
+    (MQLoss(level=[80, 90]), MQLoss(level=[80, 90])),
+])
+def test_loss_valid_loss_quantiles_allowed(loss, valid_loss):
+    """Loss/valid_loss combinations that should not raise a quantile mismatch error."""
+    model = NHITS(h=12, input_size=24, loss=loss, valid_loss=valid_loss, max_steps=1)
+    NeuralForecast(models=[model], freq="M")
+
+
+@pytest.mark.parametrize("loss,valid_loss", [
+    # MQLoss quantiles embedded in loss computation — mismatch must be rejected
+    (MQLoss(level=[80, 90]), MQLoss(level=[50])),
+    # GMM + sCRPS reproduces the issue
+    (GMM(n_components=5, level=[80, 90]), sCRPS(level=[50])),
+])
+def test_loss_valid_loss_quantiles_mismatch_raises(loss, valid_loss):
+    """Loss/valid_loss combinations with mismatched quantiles must raise ValueError."""
+    model = NHITS(h=12, input_size=24, loss=loss, valid_loss=valid_loss, max_steps=1)
+    with pytest.raises(ValueError, match="quantiles.*do not match"):
+        NeuralForecast(models=[model], freq="M")
+
+
+def test_trainer_caching(setup_airplane_data):
+    """Trainer is reused across predict calls and invalidated when kwargs change."""
+    AirPassengersPanel_train, _ = setup_airplane_data
+
+    nf = NeuralForecast(
+        models=[NHITS(h=12, input_size=24, max_steps=1)], freq="M"
+    )
+    nf.fit(AirPassengersPanel_train)
+    model = nf.models[0]
+
+    # First call creates the cache
+    nf.predict()
+    assert hasattr(model, "_pred_trainer"), "Trainer should be cached after first predict"
+    trainer_1 = model._pred_trainer
+
+    # Second call reuses the same Trainer instance
+    nf.predict()
+    assert model._pred_trainer is trainer_1, "Trainer should be reused on repeated predict calls"
+
+    # Adding a new key invalidates the cache
+    cached_kwargs = model._pred_trainer_kwargs.copy()
+    model._pred_trainer_kwargs = {**cached_kwargs, "__dummy__": True}
+    nf.predict()
+    trainer_2 = model._pred_trainer
+    assert trainer_2 is not trainer_1, "Trainer should be replaced when a kwarg is added"
+
+    # Changing an existing value also invalidates the cache
+    model._pred_trainer_kwargs = {**model._pred_trainer_kwargs, "enable_checkpointing": True}
+    nf.predict()
+    assert model._pred_trainer is not trainer_2, "Trainer should be replaced when a kwarg value changes"
+
+
+def test_predict_insample_uses_correct_static_per_series():
+    """Regression: predict_insample built each single-series dataset with the full
+    static array, so every series was predicted with the first series' static
+    features. Two series with identical history but different static must yield
+    different insample predictions."""
+    n = 48
+    df = pd.DataFrame(
+        {
+            "unique_id": ["A"] * n + ["B"] * n,
+            "ds": np.tile(pd.date_range("2020-01-01", periods=n, freq="D"), 2),
+            "y": np.tile(np.arange(n, dtype=float), 2),  # identical history for A and B
+        }
+    )
+    static_df = pd.DataFrame({"unique_id": ["A", "B"], "sval": [0.0, 1000.0]})
+
+    nf = NeuralForecast(
+        models=[NHITS(h=6, input_size=12, max_steps=2, stat_exog_list=["sval"])],
+        freq="D",
+    )
+    nf.fit(df, static_df=static_df)
+    ins = nf.predict_insample()
+
+    a = ins[ins["unique_id"] == "A"]["NHITS"].to_numpy()
+    b = ins[ins["unique_id"] == "B"]["NHITS"].to_numpy()
+    # Same history, different static -> predictions must differ once static is aligned.
+    assert not np.allclose(a, b), "series B was predicted with series A's static features"

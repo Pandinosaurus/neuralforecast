@@ -145,6 +145,9 @@ class TimeXer(BaseModel):
         futr_exog_list (str list): future exogenous columns.
         hist_exog_list (str list): historic exogenous columns.
         stat_exog_list (str list): static exogenous columns.
+        cat_exog_list (str list): exogenous columns (from `hist_exog_list` / `stat_exog_list`) to embed instead of scale.
+        categorical_cardinalities (dict): mapping from each categorical column to its number of distinct categories.
+        cat_emb_dim (str or int): categorical embedding size strategy ('fastai', 'sqrt', 'half') or an explicit integer.
         patch_len (int): length of patches.
         hidden_size (int): dimension of the model.
         n_heads (int): number of heads.
@@ -153,12 +156,13 @@ class TimeXer(BaseModel):
         factor (int): attention factor.
         dropout (float): dropout rate.
         use_norm (bool): whether to normalize or not.
-        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch).
-        valid_loss (PyTorch module): instantiated valid loss class from [losses collection](./losses.pytorch).
+        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch.html).
+        valid_loss (PyTorch module): instantiated valid loss class from [losses collection](./losses.pytorch.html).
         max_steps (int): maximum number of training steps.
         learning_rate (float): Learning rate between (0, 1).
         num_lr_decays (int): Number of learning rate decays, evenly distributed across max_steps.
         early_stop_patience_steps (int): Number of validation iterations before early stopping.
+        val_monitor (str): metric to monitor for early stopping. Valid options: "ptl/val_loss", "valid_loss", "train_loss". Default: "ptl/val_loss".
         val_check_steps (int): Number of training steps between every validation loss check.
         batch_size (int): number of different series in each batch.
         valid_batch_size (int): number of different series in each validation and test batch, if None uses batch_size.
@@ -176,16 +180,17 @@ class TimeXer(BaseModel):
         lr_scheduler (Subclass of 'torch.optim.lr_scheduler.LRScheduler'): optional, user specified lr_scheduler instead of the default choice (StepLR).
         lr_scheduler_kwargs (dict): optional, list of parameters used by the user specified `lr_scheduler`.
         dataloader_kwargs (dict): optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`.
-        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
+        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lightning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
 
     References:
         - [Yuxuan Wang, Haixu Wu, Jiaxiang Dong, Guo Qin, Haoran Zhang, Yong Liu, Yunzhong Qiu, Jianmin Wang, Mingsheng Long. "TimeXer: Empowering Transformers for Time Series Forecasting with Exogenous Variables"](https://arxiv.org/abs/2402.19072)
     """
 
     # Class attributes
-    EXOGENOUS_FUTR = True
+    EXOGENOUS_FUTR = False
     EXOGENOUS_HIST = True
     EXOGENOUS_STAT = True
+    EXOGENOUS_CAT = True
     MULTIVARIATE = True  # If the model produces multivariate forecasts (True) or univariate (False)
     RECURRENT = (
         False  # If the model produces forecasts recursively (True) or direct (False)
@@ -199,6 +204,9 @@ class TimeXer(BaseModel):
         futr_exog_list=None,
         hist_exog_list=None,
         stat_exog_list=None,
+        cat_exog_list=None,
+        categorical_cardinalities=None,
+        cat_emb_dim="fastai",
         exclude_insample_y: bool = False,
         patch_len: int = 16,
         hidden_size: int = 512,
@@ -214,6 +222,7 @@ class TimeXer(BaseModel):
         learning_rate: float = 1e-3,
         num_lr_decays: int = -1,
         early_stop_patience_steps: int = -1,
+        val_monitor: str = "ptl/val_loss",
         val_check_steps: int = 100,
         batch_size: int = 32,
         valid_batch_size: Optional[int] = None,
@@ -241,6 +250,9 @@ class TimeXer(BaseModel):
             futr_exog_list=futr_exog_list,
             hist_exog_list=hist_exog_list,
             stat_exog_list=stat_exog_list,
+            cat_exog_list=cat_exog_list,
+            categorical_cardinalities=categorical_cardinalities,
+            cat_emb_dim=cat_emb_dim,
             exclude_insample_y=exclude_insample_y,
             loss=loss,
             valid_loss=valid_loss,
@@ -248,6 +260,7 @@ class TimeXer(BaseModel):
             learning_rate=learning_rate,
             num_lr_decays=num_lr_decays,
             early_stop_patience_steps=early_stop_patience_steps,
+            val_monitor=val_monitor,
             val_check_steps=val_check_steps,
             batch_size=batch_size,
             valid_batch_size=valid_batch_size,
@@ -370,41 +383,32 @@ class TimeXer(BaseModel):
     def forward(self, windows_batch):
         insample_y = windows_batch["insample_y"]  # [B, L, N]
         hist_exog = windows_batch["hist_exog"]    # [B, X, L, N]
-        futr_exog = windows_batch["futr_exog"]    # [B, F, L+h, N]
         stat_exog = windows_batch["stat_exog"]    # [N, S]
-        
-        B, L, N = insample_y.shape
-        
+
+        B, L, _ = insample_y.shape
+
         # Build exogenous features for the input sequence
         exog_list = []
-        
+
         # Add historical exogenous
         if self.hist_exog_size > 0:
             # hist_exog: [B, X, L, N] -> [B, L, X, N] -> [B, L, X*N]
             hist_exog_input = hist_exog.permute(0, 2, 1, 3)  # [B, L, X, N]
             hist_exog_input = hist_exog_input.reshape(B, L, -1)  # [B, L, X*N]
             exog_list.append(hist_exog_input)
-        
-        # Add future exogenous
-        if self.futr_exog_size > 0:
-            # Take only the input sequence part of future exogenous
-            futr_exog_input = futr_exog[:, :, :L, :]  # [B, F, L, N]
-            futr_exog_input = futr_exog_input.permute(0, 2, 1, 3)  # [B, L, F, N]
-            futr_exog_input = futr_exog_input.reshape(B, L, -1)  # [B, L, F*N]
-            exog_list.append(futr_exog_input)
-        
+
         # Combine all exogenous features
         if len(exog_list) > 0:
-            x_mark_enc = torch.cat(exog_list, dim=-1)  # [B, L, (X+F)*N]
+            x_mark_enc = torch.cat(exog_list, dim=-1)  # [B, L, X*N]
         else:
             x_mark_enc = None
-        
+
         # Add static exogenous to the cross-attention context
         if self.stat_exog_size > 0 and x_mark_enc is not None:
             # stat_exog: [N, S] -> [B, L, N*S]
             stat_exog_expanded = stat_exog.reshape(-1).unsqueeze(0).unsqueeze(0)  # [1, 1, N*S]
             stat_exog_expanded = stat_exog_expanded.repeat(B, L, 1)  # [B, L, N*S]
-            x_mark_enc = torch.cat([x_mark_enc, stat_exog_expanded], dim=-1)  # [B, L, (X+F)*N + N*S]
+            x_mark_enc = torch.cat([x_mark_enc, stat_exog_expanded], dim=-1)  # [B, L, X*N + N*S]
         elif self.stat_exog_size > 0:
             # Only static exogenous available
             stat_exog_expanded = stat_exog.reshape(-1).unsqueeze(0).unsqueeze(0)

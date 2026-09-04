@@ -641,7 +641,7 @@ class _MultiheadAttention(nn.Module):
             lsa=lsa,
         )
 
-        # Poject output
+        # Project output
         self.to_out = nn.Sequential(
             nn.Linear(n_heads * d_v, hidden_size), nn.Dropout(proj_dropout)
         )
@@ -704,7 +704,7 @@ class _MultiheadAttention(nn.Module):
 class _ScaledDotProductAttention(nn.Module):
     """
     Scaled Dot-Product Attention module (Attention is all you need by Vaswani et al., 2017) with optional residual attention from previous layer
-    (Realformer: Transformer likes residual attention by He et al, 2020) and locality self sttention (Vision Transformer for Small-Size Datasets
+    (Realformer: Transformer likes residual attention by He et al, 2020) and locality self attention (Vision Transformer for Small-Size Datasets
     by Lee et al, 2021)
     """
 
@@ -832,17 +832,18 @@ class PatchTST(BaseModel):
         stride (int): stride of patch.
         revin (bool): bool to use RevIn.
         revin_affine (bool): bool to use affine in RevIn.
-        revin_subtract_last (bool): bool to use substract last in RevIn.
+        revin_subtract_last (bool): bool to use subtract last in RevIn.
         activation (str): activation from ['gelu','relu'].
         res_attention (bool): bool to use residual attention.
         batch_normalization (bool): bool to use batch normalization.
         learn_pos_embed (bool): bool to learn positional embedding.
-        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch).
-        valid_loss (PyTorch module): instantiated valid loss class from [losses collection](./losses.pytorch).
+        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch.html).
+        valid_loss (PyTorch module): instantiated valid loss class from [losses collection](./losses.pytorch.html).
         max_steps (int): maximum number of training steps.
         learning_rate (float): learning rate between (0, 1).
         num_lr_decays (int): number of learning rate decays, evenly distributed across max_steps.
         early_stop_patience_steps (int): number of validation iterations before early stopping.
+        val_monitor (str): metric to monitor for early stopping. Valid options: "ptl/val_loss", "valid_loss", "train_loss". Default: "ptl/val_loss".
         val_check_steps (int): number of training steps between every validation loss check.
         batch_size (int): number of different series in each batch.
         valid_batch_size (int): number of different series in each validation and test batch, if None uses batch_size.
@@ -860,7 +861,7 @@ class PatchTST(BaseModel):
         lr_scheduler (Subclass of 'torch.optim.lr_scheduler.LRScheduler'): optional, user specified lr_scheduler instead of the default choice (StepLR).
         lr_scheduler_kwargs (dict): optional, list of parameters used by the user specified `lr_scheduler`.
         dataloader_kwargs (dict): optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`.
-        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
+        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lightning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
 
     References:
         - [Nie, Y., Nguyen, N. H., Sinthong, P., & Kalagnanam, J. (2022). "A Time Series is Worth 64 Words: Long-term Forecasting with Transformers"](https://arxiv.org/pdf/2211.14730.pdf)
@@ -906,6 +907,7 @@ class PatchTST(BaseModel):
         learning_rate: float = 1e-4,
         num_lr_decays: int = -1,
         early_stop_patience_steps: int = -1,
+        val_monitor: str = "ptl/val_loss",
         val_check_steps: int = 100,
         batch_size: int = 32,
         valid_batch_size: Optional[int] = None,
@@ -938,6 +940,7 @@ class PatchTST(BaseModel):
             learning_rate=learning_rate,
             num_lr_decays=num_lr_decays,
             early_stop_patience_steps=early_stop_patience_steps,
+            val_monitor=val_monitor,
             val_check_steps=val_check_steps,
             batch_size=batch_size,
             valid_batch_size=valid_batch_size,

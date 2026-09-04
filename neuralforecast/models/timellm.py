@@ -186,9 +186,9 @@ class TimeLLM(BaseModel):
         n_heads (int): number of heads in attention layer. Default: 8
         enc_in (int): encoder input size. Default: 7
         dec_in (int): decoder input size. Default: 7
-        llm (str): Path to pretrained LLM model to use. If not specified, it will use GPT-2 from https://huggingface.co/openai-community/gpt2"<br>
-        llm_config (dict): Deprecated, configuration of LLM. If not specified, it will use the configuration of GPT-2 from https://huggingface.co/openai-community/gpt2"<br>
-        llm_tokenizer (str): Deprecated, tokenizer of LLM. If not specified, it will use the GPT-2 tokenizer from https://huggingface.co/openai-community/gpt2"<br>
+        llm (str): Path to pretrained LLM model to use. If not specified, it will use GPT-2 from https://huggingface.co/openai-community/gpt2"
+        llm_config (dict): Deprecated, configuration of LLM. If not specified, it will use the configuration of GPT-2 from https://huggingface.co/openai-community/gpt2"
+        llm_tokenizer (str): Deprecated, tokenizer of LLM. If not specified, it will use the GPT-2 tokenizer from https://huggingface.co/openai-community/gpt2"
         llm_num_hidden_layers (int): hidden layers in LLM. Default: 32
         llm_output_attention (bool): whether to output attention in encoder. Default: True
         llm_output_hidden_states (bool): whether to output hidden states. Default: True
@@ -197,8 +197,8 @@ class TimeLLM(BaseModel):
         stat_exog_list (list): static exogenous columns.
         hist_exog_list (list): historic exogenous columns.
         futr_exog_list (list): future exogenous columns.
-        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch).
-        valid_loss (PyTorch module): instantiated valid loss class from [losses collection](./losses.pytorch).
+        loss (PyTorch module): instantiated train loss class from [losses collection](./losses.pytorch.html).
+        valid_loss (PyTorch module): instantiated valid loss class from [losses collection](./losses.pytorch.html).
         learning_rate (float): Learning rate between (0, 1). Default: 1e-3
         max_steps (int): maximum number of training steps. Default: 1000
         val_check_steps (int): Number of training steps between every validation loss check. Default: 100
@@ -207,10 +207,11 @@ class TimeLLM(BaseModel):
         windows_batch_size (int): number of windows to sample in each training batch, default uses all. Default: 1024
         inference_windows_batch_size (int): number of windows to sample in each inference batch. Default: 1024
         start_padding_enabled (bool): if True, the model will pad the time series with zeros at the beginning, by input size. Default: False
-        training_data_availability_threshold (Union[float, List[float]]): minimum fraction of valid data points required for training windows. Single float applies to both insample and outsample; list of two floats specifies [insample_fraction, outsample_fraction]. Default 0.0 allows windows with only 1 valid data point (current behavior).<br>
+        training_data_availability_threshold (Union[float, List[float]]): minimum fraction of valid data points required for training windows. Single float applies to both insample and outsample; list of two floats specifies [insample_fraction, outsample_fraction]. Default 0.0 allows windows with only 1 valid data point (current behavior).
         step_size (int): step size between each window of temporal data. Default: 1
         num_lr_decays (int): Number of learning rate decays, evenly distributed across max_steps. Default: -1
         early_stop_patience_steps (int): Number of validation iterations before early stopping. Default: -1
+        val_monitor (str): metric to monitor for early stopping. Valid options: "ptl/val_loss", "valid_loss", "train_loss". Default: "ptl/val_loss"
         scaler_type (str): type of scaler for temporal inputs normalization see [temporal scalers](https://github.com/Nixtla/neuralforecast/blob/main/neuralforecast/common/_scalers.py). Default: 'identity'
         random_seed (int): random_seed for pytorch initializer and numpy generators. Default: 1
         drop_last_loader (bool): if True `TimeSeriesDataLoader` drops last non-full batch. Default: False
@@ -220,7 +221,7 @@ class TimeLLM(BaseModel):
         lr_scheduler (Subclass of 'torch.optim.lr_scheduler.LRScheduler'): optional, user specified lr_scheduler instead of the default choice (StepLR).
         lr_scheduler_kwargs (dict): optional, list of parameters used by the user specified `lr_scheduler`.
         dataloader_kwargs (dict): optional, list of parameters passed into the PyTorch Lightning dataloader by the `TimeSeriesDataLoader`.
-        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lighning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
+        **trainer_kwargs (int):  keyword trainer arguments inherited from [PyTorch Lightning's trainer](https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.trainer.trainer.Trainer.html?highlight=trainer).
 
     References:
         - [Ming Jin, Shiyu Wang, Lintao Ma, Zhixuan Chu, James Y. Zhang, Xiaoming Shi, Pin-Yu Chen, Yuxuan Liang, Yuan-Fang Li, Shirui Pan, Qingsong Wen. "Time-LLM: Time Series Forecasting by Reprogramming Large Language Models"](https://arxiv.org/abs/2310.01728)
@@ -273,6 +274,7 @@ class TimeLLM(BaseModel):
         step_size: int = 1,
         num_lr_decays: int = 0,
         early_stop_patience_steps: int = -1,
+        val_monitor: str = "ptl/val_loss",
         scaler_type: str = "identity",
         random_seed: int = 1,
         drop_last_loader: bool = False,
@@ -296,6 +298,7 @@ class TimeLLM(BaseModel):
             learning_rate=learning_rate,
             num_lr_decays=num_lr_decays,
             early_stop_patience_steps=early_stop_patience_steps,
+            val_monitor=val_monitor,
             val_check_steps=val_check_steps,
             batch_size=batch_size,
             valid_batch_size=valid_batch_size,

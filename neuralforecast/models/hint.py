@@ -11,10 +11,13 @@ import torch
 
 
 def get_bottomup_P(S: np.ndarray):
-    """BottomUp Reconciliation Matrix.
+    r"""BottomUp Reconciliation Matrix.
 
     Creates BottomUp hierarchical \"projection\" matrix is defined as:
-    $$\mathbf{P}_{\\text{BU}} = [\mathbf{0}_{\mathrm{[b],[a]}}\;|\;\mathbf{I}_{\mathrm{[b][b]}}]$$
+
+    ```math
+    \mathbf{P}_{\text{BU}} = [\mathbf{0}_{\mathrm{[b],[a]}}\;|\;\mathbf{I}_{\mathrm{[b][b]}}]
+    ```
 
     Args:
         S (np.ndarray): Summing matrix of size (`base`, `bottom`).
@@ -34,11 +37,14 @@ def get_bottomup_P(S: np.ndarray):
 
 
 def get_mintrace_ols_P(S: np.ndarray):
-    """MinTraceOLS Reconciliation Matrix.
+    r"""MinTraceOLS Reconciliation Matrix.
 
     Creates MinTraceOLS reconciliation matrix as proposed by Wickramasuriya et al.
 
-    $$\mathbf{P}_{\\text{MinTraceOLS}}=\\left(\mathbf{S}^{\intercal}\mathbf{S}\\right)^{-1}\mathbf{S}^{\intercal}$$
+    ```math
+    \mathbf{P}_{\text{MinTraceOLS}}=\left(\mathbf{S}^{\intercal}\mathbf{S}\right)^{-1}\mathbf{S}^{\intercal}
+    ```
+
 
     Args:
         S (np.ndarray): Summing matrix of size (`base`, `bottom`).
@@ -64,15 +70,19 @@ def get_mintrace_ols_P(S: np.ndarray):
 
 
 def get_mintrace_wls_P(S: np.ndarray):
-    """MinTraceOLS Reconciliation Matrix.
+    r"""MinTraceOLS Reconciliation Matrix.
 
     Creates MinTraceOLS reconciliation matrix as proposed by Wickramasuriya et al.
     Depending on a weighted GLS estimator and an estimator of the covariance matrix of the coherency errors $\mathbf{W}_{h}$.
 
-    $$ \mathbf{W}_{h} = \mathrm{Diag}(\mathbf{S} \mathbb{1}_{[b]})$$
+    ```math
+    \mathbf{W}_{h} = \mathrm{Diag}(\mathbf{S} \mathbb{1}_{[b]})
+    ```
 
-    $$\mathbf{P}_{\\text{MinTraceWLS}}=\\left(\mathbf{S}^{\intercal}\mathbf{W}_{h}\mathbf{S}\\right)^{-1}
-    \mathbf{S}^{\intercal}\mathbf{W}^{-1}_{h}$$
+    ```math
+    \mathbf{P}_{\text{MinTraceWLS}}=\left(\mathbf{S}^{\intercal}\mathbf{W}_{h}\mathbf{S}\right)^{-1}
+    \mathbf{S}^{\intercal}\mathbf{W}^{-1}_{h}
+    ```
 
     Args:
         S (np.ndarray): Summing matrix of size (`base`, `bottom`).
@@ -124,8 +134,8 @@ class HINT:
 
     Args:
         h (int): Forecast horizon.
-        model (NeuralForecast model): Instantiated model class from [architecture collection](./models).
-        S (np.ndarray): Dumming matrix of size (`base`, `bottom`) see HierarchicalForecast's [aggregate method](../hierarchicalforecast/utils#function-aggregate).
+        model (NeuralForecast model): Instantiated model class from [architecture collection](./models.html).
+        S (np.ndarray): Dumming matrix of size (`base`, `bottom`) see HierarchicalForecast's [aggregate method](../hierarchicalforecast/utils.html#aggregate).
         reconciliation (str): HINT's reconciliation method from ['BottomUp', 'MinTraceOLS', 'MinTraceWLS'].
         alias (str, optional): Custom name of the model.
     """
@@ -150,6 +160,7 @@ class HINT:
         self.h = h
         self.model = model
         self.early_stop_patience_steps = model.early_stop_patience_steps
+        self.val_monitor = model.val_monitor
         self.S = S
         self.reconciliation = reconciliation
         self.loss = model.loss
@@ -189,13 +200,13 @@ class HINT:
     ):
         """HINT.fit
 
-        HINT trains on the entire hierarchical dataset, by minimizing a composite log 
-        likelihood objective. HINT framework integrates `TemporalNorm` into the neural 
-        forecast architecture for a scale-decoupled optimization that robustifies 
-        cross-learning the hierachy's series scales.
+        HINT trains on the entire hierarchical dataset, by minimizing a composite log
+        likelihood objective. HINT framework integrates `TemporalNorm` into the neural
+        forecast architecture for a scale-decoupled optimization that robustifies
+        cross-learning the hierarchy's series scales.
 
         Args:
-            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset` see details [here](./tsdataset)
+            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset` see details [here](./tsdataset.html)
             val_size (int): size of the validation set, (default 0).
             test_size (int): size of the test set, (default 0).
             random_seed (int): random seed for the prediction.
@@ -203,7 +214,7 @@ class HINT:
         Returns:
             self: A fitted base `NeuralForecast` model.
         """
-        model = self.model.fit(
+        self.model = self.model.fit(
             dataset=dataset,
             val_size=val_size,
             test_size=test_size,
@@ -215,7 +226,7 @@ class HINT:
         self.futr_exog_list = self.model.futr_exog_list
         self.hist_exog_list = self.model.hist_exog_list
         self.stat_exog_list = self.model.stat_exog_list
-        return model
+        return self
 
     def predict(self, dataset, step_size=1, random_seed=None, **data_module_kwargs):
         """HINT.predict
@@ -225,7 +236,7 @@ class HINT:
         bootstrapped sample reconciliation.
 
         Args:
-            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset` see details [here](./tsdataset)
+            dataset (TimeSeriesDataset): NeuralForecast's `TimeSeriesDataset` see details [here](./tsdataset.html)
             step_size (int): steps between sequential predictions, (default 1).
             random_seed (int): random seed for the prediction.
             **data_kwarg: additional parameters for the dataset module.
